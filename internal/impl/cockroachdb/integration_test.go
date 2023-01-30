@@ -2,12 +2,12 @@ package crdb
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/ory/dockertest/v3"
-	"github.com/ory/dockertest/v3/docker"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -29,30 +29,29 @@ func TestIntegrationCRDB(t *testing.T) {
 		Tag:          "latest",
 		Cmd:          []string{"start-single-node", "--insecure"},
 		ExposedPorts: []string{"8080", "26257"},
-		PortBindings: map[docker.Port][]docker.PortBinding{
-			"26257/tcp": {{HostIP: "", HostPort: "26257"}},
-		},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		assert.NoError(t, pool.Purge(resource))
 	})
 
+	port := resource.GetPort("26257/tcp")
+
 	var pgpool *pgxpool.Pool
-	resource.Expire(900)
+	require.NoError(t, resource.Expire(900))
+
 	require.NoError(t, pool.Retry(func() error {
-		pgpool, err = pgxpool.Connect(context.Background(), "postgresql://root@localhost:26257/defaultdb?sslmode=disable")
-		if err != nil {
-			return err
+		if pgpool == nil {
+			if pgpool, err = pgxpool.Connect(context.Background(), fmt.Sprintf("postgresql://root@localhost:%v/defaultdb?sslmode=disable", port)); err != nil {
+				return err
+			}
 		}
 		// Enable changefeeds
-		_, err = pgpool.Exec(context.Background(), "SET CLUSTER SETTING kv.rangefeed.enabled = true;")
-		if err != nil {
+		if _, err = pgpool.Exec(context.Background(), "SET CLUSTER SETTING kv.rangefeed.enabled = true;"); err != nil {
 			return err
 		}
 		// Create table
-		_, err = pgpool.Exec(context.Background(), "CREATE TABLE foo (a INT PRIMARY KEY);")
-		if err != nil {
+		if _, err = pgpool.Exec(context.Background(), "CREATE TABLE foo (a INT PRIMARY KEY);"); err != nil {
 			return err
 		}
 		// Insert a row in
@@ -60,35 +59,34 @@ func TestIntegrationCRDB(t *testing.T) {
 		return err
 	}))
 	t.Cleanup(func() {
-		_, _ = pgpool.Exec(context.Background(), "DROP TABLE foo;")
 		pgpool.Close()
 	})
 
-	template := `
-crdb_changefeed:
-  dsn: postgresql://root@localhost:26257/defaultdb?sslmode=disable
+	template := fmt.Sprintf(`
+cockroachdb_changefeed:
+  dsn: postgresql://root@localhost:%v/defaultdb?sslmode=disable
   tables:
     - foo
-`
+`, port)
 	streamOutBuilder := service.NewStreamBuilder()
 	require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: OFF`))
 	require.NoError(t, streamOutBuilder.AddInputYAML(template))
+
+	runCtx, cancelFn := context.WithCancel(context.Background())
+	defer cancelFn()
 
 	var outBatches []string
 	require.NoError(t, streamOutBuilder.AddBatchConsumerFunc(func(c context.Context, mb service.MessageBatch) error {
 		msgBytes, err := mb[0].AsBytes()
 		require.NoError(t, err)
 		outBatches = append(outBatches, string(msgBytes))
+		cancelFn()
 		return nil
 	}))
 
 	streamOut, err := streamOutBuilder.Build()
 	require.NoError(t, err)
+	require.Equal(t, context.Canceled, streamOut.Run(runCtx))
 
-	require.NoError(t, streamOut.Run(context.Background()))
-
-	// This is where I get stuck because the output is going to change
-	assert.Contains(t, []string{
-		"foo,[0],\"{\"\"after\"\": {\"\"a\"\": 0}}",
-	}, outBatches)
+	assert.Contains(t, outBatches, `{"primary_key":"[0]","row":"{\"after\": {\"a\": 0}}","table":"foo"}`)
 }
