@@ -15,11 +15,7 @@ import (
 
 	"github.com/benthosdev/benthos/v4/internal/component"
 	"github.com/benthosdev/benthos/v4/public/service"
-	"github.com/puzpuzpuz/xsync/v2"
 )
-
-// create package level xsync map
-var exchangeStatusMap = xsync.NewMap()
 
 func amqp09OutputSpec() *service.ConfigSpec {
 	return service.NewConfigSpec().
@@ -161,6 +157,9 @@ type amqp09Writer struct {
 	deliveryMode uint8
 	mandatory    bool
 	immediate    bool
+
+	exchangesDeclared    map[string]struct{}
+	exchangesDeclaredMut sync.Mutex
 
 	exchangeDeclare        bool
 	exchangeDeclareType    string
@@ -322,15 +321,23 @@ func (a *amqp09Writer) disconnect() error {
 func (a *amqp09Writer) declareExchange(msg *service.Message) (string, error) {
 	exchange, err := a.exchange.TryString(msg)
 	if err != nil {
-		return "", fmt.Errorf("exchange name interpolation error: #{err}")
+		return "", fmt.Errorf("exchange name interpolation error: %w", err)
 	}
 
 	if a.exchangeDeclare {
+		a.exchangesDeclaredMut.Lock()
+		defer a.exchangesDeclaredMut.Unlock()
+
+		if a.exchangesDeclared == nil {
+			a.exchangesDeclared = map[string]struct{}{}
+		}
+
 		// check if the exchange name exists in exchangeDeclarationStatus
-		if _, ok := exchangeStatusMap.Load(exchange); ok {
+		if _, exists := a.exchangesDeclared[exchange]; exists {
 			a.log.Debugf("Exchange %s exists in cache, not re-declaring", exchange)
 			return exchange, nil
 		} else {
+			a.log.Debugf("Exchange %s does not exist, declaring", exchange)
 			if err := a.amqpChan.ExchangeDeclare(
 				exchange,                 // name of the exchange
 				a.exchangeDeclareType,    // type
@@ -340,12 +347,9 @@ func (a *amqp09Writer) declareExchange(msg *service.Message) (string, error) {
 				false,                    // noWait
 				nil,                      // arguments
 			); err != nil {
-				a.conn.Close()
-				return "", fmt.Errorf("amqp failed to declare exchange: %v", err)
+				return "", fmt.Errorf("amqp failed to declare exchange: %w", err)
 			}
-			a.log.Debugf("Exchange %s does not exist, declaring", exchange)
-			// add the exchange name to exchangeDeclarationStatus
-			exchangeStatusMap.Store(exchange, "true")
+			a.exchangesDeclared[exchange] = struct{}{}
 			return exchange, nil
 		}
 	}
@@ -449,7 +453,6 @@ func (a *amqp09Writer) Write(ctx context.Context, msg *service.Message) error {
 
 	exchange, err := a.declareExchange(msg)
 	if err != nil {
-		conn.Close()
 		return fmt.Errorf("amqp failed to declare exchange: %s", err)
 	}
 	conf, err := amqpChan.PublishWithDeferredConfirmWithContext(
